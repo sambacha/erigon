@@ -13,9 +13,9 @@ jobs:
       - uses: actions/checkout@v2
       - name: Generate LSIF data
         run: lsif-go
-         id: lsif_generate
+        id: lsif_generate
       - name: Upload LSIF data
         # this will upload to Sourcegraph.com, you may need to substitute a different command.
         # by default, we ignore failures to avoid disrupting CI pipelines with non-critical errors.
         run: src lsif upload -github-token=${{ secrets.GITHUB_TOKEN }} -ignore-upload-failure
-         id: lsif_upload
+        id: lsif_upload
