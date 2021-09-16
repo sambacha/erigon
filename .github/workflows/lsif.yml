@@ -19,3 +19,10 @@ jobs:
         # by default, we ignore failures to avoid disrupting CI pipelines with non-critical errors.
         run: src lsif upload -github-token=${{ secrets.GITHUB_TOKEN }} -ignore-upload-failure
         id: lsif_upload
+      - name: Archive production artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: lsif
+          path: |
+            *.lsif
+            dump.*
