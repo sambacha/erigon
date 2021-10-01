@@ -1,0 +1,23 @@
+name: lsif-go
+on:
+  push:
+
+jobs:
+  lsif-go:
+    runs-on: ubuntu-latest
+    container: sourcegraph/lsif-go:latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: recursive
+          
+      - name: Generate LSIF data
+        run: lsif-go
+      - name: Upload LSIF data
+        # this will upload to Sourcegraph.com, you may need to substitute a different command.
+        # by default, we ignore failures to avoid disrupting CI pipelines with non-critical errors.
+        run: src lsif upload -github-token=${{ secrets.GITHUB_TOKEN }} -ignore-upload-failures
+      - uses: actions/upload-artifact@v2
+        with:
+          name: artifact
+          path: lsif*
