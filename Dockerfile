@@ -27,6 +27,8 @@ USER erigon
 
 EXPOSE 8545 8551 8546 30303 30303/udp 42069 42069/udp 8080 9090 6060
 
+CMD ["/build/bin/erigon"]
+
 # https://github.com/opencontainers/image-spec/blob/main/annotations.md
 ARG BUILD_DATE
 ARG VCS_REF
@@ -40,3 +42,5 @@ LABEL org.label-schema.build-date=$BUILD_DATE \
       org.label-schema.vendor="Torquem" \
       org.label-schema.version=$VERSION \
       org.label-schema.schema-version="1.0"
+
+STOPSIGNAL SIGINT
