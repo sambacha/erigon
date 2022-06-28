@@ -1,31 +1,36 @@
-# syntax=docker/dockerfile:1
-FROM docker.io/library/golang:1.16-alpine3.13 AS builder
+# syntax = docker/dockerfile:1.2
+FROM docker.io/library/golang:1.18-alpine3.15 AS builder
 
-RUN apk --no-cache add make gcc g++ linux-headers git bash ca-certificates libgcc libstdc++
+RUN apk --no-cache add build-base linux-headers git bash ca-certificates libstdc++
 
 WORKDIR /app
 ADD . .
 
-# expect that host run `git submodule update --init`
-RUN make erigon rpcdaemon integration sentry
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/tmp/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    make all db-tools
 
-FROM docker.io/library/alpine:3.13
+FROM docker.io/library/alpine:3.15
 
-RUN apk add --no-cache ca-certificates libgcc libstdc++ tzdata
+RUN apk add --no-cache ca-certificates libstdc++ tzdata
 COPY --from=builder /app/build/bin/* /usr/local/bin/
 
-RUN adduser -H -u 1000 -g 1000 -D erigon
+ARG PUID=1000
+ARG PGID=1000
+RUN adduser -H -u ${PUID} -g ${PGID} -D erigon
 RUN mkdir -p /home/erigon
 RUN mkdir -p /home/erigon/.local/share/erigon
 RUN chown -R erigon:erigon /home/erigon
 
 USER erigon
 
-EXPOSE 8545 8546 30303 30303/udp 30304 30304/udp 8080 9090 6060
+EXPOSE 8545 8551 8546 30303 30303/udp 42069 42069/udp 8080 9090 6060
 
 # https://github.com/opencontainers/image-spec/blob/main/annotations.md
 ARG BUILD_DATE
 ARG VCS_REF
+ARG VERSION
 LABEL org.label-schema.build-date=$BUILD_DATE \
       org.label-schema.name="Erigon" \
       org.label-schema.description="Erigon Ethereum Client" \

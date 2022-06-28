@@ -23,6 +23,7 @@ import (
 	"fmt"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/cmp"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/debug"
 	"github.com/ledgerwatch/erigon/core/types/accounts"
@@ -355,13 +356,6 @@ func (t *Trie) NeedLoadCode(addrHash common.Hash, codeHash common.Hash, bytecode
 	}
 
 	return false, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // FindSubTriesToLoad walks over the trie and creates the list of DB prefixes and
@@ -720,7 +714,7 @@ func (t *Trie) HookSubTries(subTries SubTries, hooks [][]byte) error {
 			return fmt.Errorf("root==nil for hook %x", hookNibbles)
 		}
 		if err := t.hook(hookNibbles, root, hash[:]); err != nil {
-			return fmt.Errorf("hook %x: %v", hookNibbles, err)
+			return fmt.Errorf("hook %x: %w", hookNibbles, err)
 		}
 	}
 	return nil
@@ -852,7 +846,7 @@ func (t *Trie) deleteRecursive(origNode node, key []byte, keyStart int, preserve
 	switch n := origNode.(type) {
 	case *shortNode:
 		matchlen := prefixLen(key[keyStart:], n.Key)
-		if matchlen == min(len(n.Key), len(key[keyStart:])) || n.Key[matchlen] == 16 || key[keyStart+matchlen] == 16 {
+		if matchlen == cmp.Min(len(n.Key), len(key[keyStart:])) || n.Key[matchlen] == 16 || key[keyStart+matchlen] == 16 {
 			fullMatch := matchlen == len(key)-keyStart
 			removeNodeEntirely := fullMatch
 			if preserveAccountNode {

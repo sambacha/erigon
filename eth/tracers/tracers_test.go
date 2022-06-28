@@ -21,8 +21,8 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"encoding/json"
-	"io/ioutil"
 	"math/big"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -177,16 +177,17 @@ func TestPrestateTracerCreate2(t *testing.T) {
 	}
 
 	_, tx := memdb.NewTestTx(t)
-	statedb, _ := tests.MakePreState(params.Rules{}, tx, alloc, context.BlockNumber)
+	rules := &params.Rules{}
+	statedb, _ := tests.MakePreState(rules, tx, alloc, context.BlockNumber)
 
 	// Create the tracer, the EVM environment and run it
-	tracer, err := New("prestateTracer", txContext)
+	tracer, err := New("prestateTracer", new(Context))
 	if err != nil {
 		t.Fatalf("failed to create call tracer: %v", err)
 	}
 	evm := vm.NewEVM(context, txContext, statedb, params.MainnetChainConfig, vm.Config{Debug: true, Tracer: tracer})
 
-	msg, err := txn.AsMessage(*signer, nil)
+	msg, err := txn.AsMessage(*signer, nil, rules)
 	if err != nil {
 		t.Fatalf("failed to prepare transaction for tracing: %v", err)
 	}
@@ -211,7 +212,7 @@ func TestPrestateTracerCreate2(t *testing.T) {
 // Iterates over all the input-output datasets in the tracer test harness and
 // runs the JavaScript tracers against them.
 func TestCallTracer(t *testing.T) {
-	files, filesErr := ioutil.ReadDir("testdata")
+	files, filesErr := os.ReadDir("testdata")
 	if filesErr != nil {
 		t.Fatalf("failed to retrieve tracer test suite: %v", filesErr)
 	}
@@ -224,7 +225,7 @@ func TestCallTracer(t *testing.T) {
 			t.Parallel()
 
 			// Call tracer test found, read if from disk
-			blob, blobErr := ioutil.ReadFile(filepath.Join("testdata", file.Name()))
+			blob, blobErr := os.ReadFile(filepath.Join("testdata", file.Name()))
 			if blobErr != nil {
 				t.Fatalf("failed to read testcase: %v", blobErr)
 			}
@@ -255,17 +256,18 @@ func TestCallTracer(t *testing.T) {
 			}
 
 			_, tx := memdb.NewTestTx(t)
-			statedb, err := tests.MakePreState(params.Rules{}, tx, test.Genesis.Alloc, uint64(test.Context.Number))
+			rules := &params.Rules{}
+			statedb, err := tests.MakePreState(rules, tx, test.Genesis.Alloc, uint64(test.Context.Number))
 			require.NoError(t, err)
 
 			// Create the tracer, the EVM environment and run it
-			tracer, err := New("callTracer", txContext)
+			tracer, err := New("callTracer", new(Context))
 			if err != nil {
 				t.Fatalf("failed to create call tracer: %v", err)
 			}
 			evm := vm.NewEVM(context, txContext, statedb, test.Genesis.Config, vm.Config{Debug: true, Tracer: tracer})
 
-			msg, err := txn.AsMessage(*signer, nil)
+			msg, err := txn.AsMessage(*signer, nil, rules)
 			if err != nil {
 				t.Fatalf("failed to prepare transaction for tracing: %v", err)
 			}

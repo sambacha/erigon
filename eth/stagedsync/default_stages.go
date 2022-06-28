@@ -8,27 +8,7 @@ import (
 	"github.com/ledgerwatch/erigon/ethdb/prune"
 )
 
-func DefaultStages(ctx context.Context,
-	sm prune.Mode,
-	headers HeadersCfg,
-	blockHashCfg BlockHashesCfg,
-	snapshotHeaders SnapshotHeadersCfg,
-	bodies BodiesCfg,
-	snapshotBodies SnapshotBodiesCfg,
-	senders SendersCfg,
-	exec ExecuteBlockCfg,
-	trans TranspileCfg,
-	snapshotState SnapshotStateCfg,
-	hashState HashStateCfg,
-	trieCfg TrieCfg,
-	history HistoryCfg,
-	logIndex LogIndexCfg,
-	callTraces CallTracesCfg,
-	txLookup TxLookupCfg,
-	txPool TxPoolCfg,
-	finish FinishCfg,
-	test bool,
-) []*Stage {
+func DefaultStages(ctx context.Context, sm prune.Mode, headers HeadersCfg, cumulativeIndex CumulativeIndexCfg, blockHashCfg BlockHashesCfg, bodies BodiesCfg, issuance IssuanceCfg, senders SendersCfg, exec ExecuteBlockCfg, trans TranspileCfg, hashState HashStateCfg, trieCfg TrieCfg, history HistoryCfg, logIndex LogIndexCfg, callTraces CallTracesCfg, txLookup TxLookupCfg, finish FinishCfg, test bool) []*Stage {
 	return []*Stage{
 		{
 			ID:          stages.Headers,
@@ -37,13 +17,26 @@ func DefaultStages(ctx context.Context,
 				if badBlockUnwind {
 					return nil
 				}
-				return HeadersForward(s, u, ctx, tx, headers, firstCycle, test)
+				return SpawnStageHeaders(s, u, ctx, tx, headers, firstCycle, test)
 			},
 			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
 				return HeadersUnwind(u, s, tx, headers, test)
 			},
 			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
 				return HeadersPrune(p, tx, headers, ctx)
+			},
+		},
+		{
+			ID:          stages.CumulativeIndex,
+			Description: "Write Cumulative Index",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return SpawnStageCumulativeIndex(cumulativeIndex, s, tx, ctx)
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindCumulativeIndexStage(u, cumulativeIndex, tx, ctx)
+			},
+			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
+				return PruneCumulativeIndexStage(p, tx, ctx)
 			},
 		},
 		{
@@ -60,46 +53,16 @@ func DefaultStages(ctx context.Context,
 			},
 		},
 		{
-			ID:                  stages.CreateHeadersSnapshot,
-			Description:         "Create headers snapshot",
-			Disabled:            true,
-			DisabledDescription: "Enable by --snapshot.layout",
-			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
-				return SpawnHeadersSnapshotGenerationStage(s, tx, snapshotHeaders, firstCycle, ctx)
-			},
-			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
-				return UnwindHeadersSnapshotGenerationStage(u, tx, snapshotHeaders, ctx)
-			},
-			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
-				return PruneHeadersSnapshotGenerationStage(p, tx, snapshotHeaders, ctx)
-			},
-		},
-		{
 			ID:          stages.Bodies,
 			Description: "Download block bodies",
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
-				return BodiesForward(s, u, ctx, tx, bodies, test)
+				return BodiesForward(s, u, ctx, tx, bodies, test, firstCycle)
 			},
 			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
 				return UnwindBodiesStage(u, tx, bodies, ctx)
 			},
 			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
 				return PruneBodiesStage(p, tx, bodies, ctx)
-			},
-		},
-		{
-			ID:                  stages.CreateBodiesSnapshot,
-			Description:         "Create bodies snapshot",
-			Disabled:            true,
-			DisabledDescription: "Enable by --snapshot.layout",
-			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
-				return SpawnBodiesSnapshotGenerationStage(s, tx, snapshotBodies, ctx)
-			},
-			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
-				return UnwindBodiesSnapshotGenerationStage(u, tx, snapshotBodies, ctx)
-			},
-			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
-				return PruneBodiesSnapshotGenerationStage(p, tx, snapshotBodies, ctx)
 			},
 		},
 		{
@@ -141,21 +104,6 @@ func DefaultStages(ctx context.Context,
 			},
 			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
 				return PruneTranspileStage(p, tx, trans, firstCycle, ctx)
-			},
-		},
-		{
-			ID:                  stages.CreateStateSnapshot,
-			Description:         "Create state snapshot",
-			Disabled:            true,
-			DisabledDescription: "Enable by --snapshot.layout",
-			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
-				return SpawnStateSnapshotGenerationStage(s, tx, snapshotState, ctx)
-			},
-			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
-				return UnwindStateSnapshotGenerationStage(u, tx, snapshotState, ctx)
-			},
-			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
-				return PruneStateSnapshotGenerationStage(p, tx, snapshotState, ctx)
 			},
 		},
 		{
@@ -242,7 +190,7 @@ func DefaultStages(ctx context.Context,
 			ID:          stages.TxLookup,
 			Description: "Generate tx lookup index",
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
-				return SpawnTxLookup(s, tx, txLookup, ctx)
+				return SpawnTxLookup(s, tx, 0 /* toBlock */, txLookup, ctx)
 			},
 			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
 				return UnwindTxLookup(u, s, tx, txLookup, ctx)
@@ -252,17 +200,16 @@ func DefaultStages(ctx context.Context,
 			},
 		},
 		{
-			ID:          stages.TxPool,
-			Description: "Update transaction pool",
-			Disabled:    txPool.config.Disable || txPool.config.V2,
-			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, _ Unwinder, tx kv.RwTx) error {
-				return SpawnTxPool(s, tx, txPool, ctx)
+			ID:          stages.Issuance,
+			Description: "Issuance computation",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return SpawnStageIssuance(issuance, s, tx, ctx)
 			},
 			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
-				return UnwindTxPool(u, s, tx, txPool, ctx)
+				return UnwindIssuanceStage(u, issuance, tx, ctx)
 			},
 			Prune: func(firstCycle bool, p *PruneState, tx kv.RwTx) error {
-				return PruneTxPool(p, tx, txPool, ctx)
+				return PruneIssuanceStage(p, issuance, tx, ctx)
 			},
 		},
 		{
@@ -281,18 +228,92 @@ func DefaultStages(ctx context.Context,
 	}
 }
 
+// StateStages are all stages necessary for basic unwind and stage computation, it is primarly used to process side forks and memory execution.
+func StateStages(ctx context.Context, headers HeadersCfg, bodies BodiesCfg, blockHashCfg BlockHashesCfg, senders SendersCfg, exec ExecuteBlockCfg, hashState HashStateCfg, trieCfg TrieCfg) []*Stage {
+	return []*Stage{
+		{
+			ID:          stages.Headers,
+			Description: "Download headers",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return nil
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return HeadersUnwind(u, s, tx, headers, false)
+			},
+		},
+		{
+			ID:          stages.BlockHashes,
+			Description: "Write block hashes",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return SpawnBlockHashStage(s, tx, blockHashCfg, ctx)
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindBlockHashStage(u, tx, blockHashCfg, ctx)
+			},
+		},
+		{
+			ID:          stages.Bodies,
+			Description: "Download block bodies",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return nil
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindBodiesStage(u, tx, bodies, ctx)
+			},
+		},
+		{
+			ID:          stages.Senders,
+			Description: "Recover senders from tx signatures",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return SpawnRecoverSendersStage(senders, s, u, tx, 0, ctx)
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindSendersStage(u, tx, senders, ctx)
+			},
+		},
+		{
+			ID:          stages.Execution,
+			Description: "Execute blocks w/o hash checks",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return SpawnExecuteBlocksStage(s, u, tx, 0, ctx, exec, firstCycle)
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindExecutionStage(u, s, tx, ctx, exec, firstCycle)
+			},
+		},
+		{
+			ID:          stages.HashState,
+			Description: "Hash the key in the state",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				return SpawnHashStateStage(s, tx, hashState, ctx)
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindHashStateStage(u, s, tx, hashState, ctx)
+			},
+		},
+		{
+			ID:          stages.IntermediateHashes,
+			Description: "Generate intermediate hashes and computing state root",
+			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx) error {
+				_, err := SpawnIntermediateHashesStage(s, u, tx, trieCfg, ctx)
+				return err
+			},
+			Unwind: func(firstCycle bool, u *UnwindState, s *StageState, tx kv.RwTx) error {
+				return UnwindIntermediateHashesStage(u, s, tx, trieCfg, ctx)
+			},
+		},
+	}
+}
+
 var DefaultForwardOrder = UnwindOrder{
 	stages.Headers,
 	stages.BlockHashes,
-	stages.CreateHeadersSnapshot,
 	stages.Bodies,
-	stages.CreateBodiesSnapshot,
 
 	// Stages below don't use Internet
 	stages.Senders,
 	stages.Execution,
 	stages.Translation,
-	stages.CreateStateSnapshot,
 	stages.HashState,
 	stages.IntermediateHashes,
 	stages.CallTraces,
@@ -300,7 +321,6 @@ var DefaultForwardOrder = UnwindOrder{
 	stages.StorageHistoryIndex,
 	stages.LogIndex,
 	stages.TxLookup,
-	stages.TxPool,
 	stages.Finish,
 }
 
@@ -323,18 +343,22 @@ var DefaultUnwindOrder = UnwindOrder{
 	stages.HashState,
 	stages.IntermediateHashes,
 
-	stages.CreateStateSnapshot,
 	stages.Translation,
 	stages.Execution,
 	stages.Senders,
 
-	// Unwinding of tx pool (re-injecting transactions into the pool needs to happen after unwinding execution)
-	// also tx pool is before senders because senders unwind is inside cycle transaction
-	stages.TxPool,
-
-	stages.CreateBodiesSnapshot,
 	stages.Bodies,
-	stages.CreateHeadersSnapshot,
+	stages.BlockHashes,
+	stages.Headers,
+}
+
+var StateUnwindOrder = UnwindOrder{
+	// Unwinding of IHashes needs to happen after unwinding HashState
+	stages.HashState,
+	stages.IntermediateHashes,
+	stages.Execution,
+	stages.Senders,
+	stages.Bodies,
 	stages.BlockHashes,
 	stages.Headers,
 }
@@ -351,18 +375,11 @@ var DefaultPruneOrder = PruneOrder{
 	stages.HashState,
 	stages.IntermediateHashes,
 
-	stages.CreateStateSnapshot,
 	stages.Translation,
 	stages.Execution,
 	stages.Senders,
 
-	// Unwinding of tx pool (reinjecting transactions into the pool needs to happen after unwinding execution)
-	// also tx pool is before senders because senders unwind is inside cycle transaction
-	stages.TxPool,
-
-	stages.CreateBodiesSnapshot,
 	stages.Bodies,
-	stages.CreateHeadersSnapshot,
 	stages.BlockHashes,
 	stages.Headers,
 }

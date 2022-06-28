@@ -2,24 +2,30 @@ package rpcdaemontest
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"net"
 	"testing"
 
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon-lib/gointerfaces/remote"
+	"github.com/ledgerwatch/erigon-lib/gointerfaces/starknet"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/txpool"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/accounts/abi/bind"
 	"github.com/ledgerwatch/erigon/accounts/abi/bind/backends"
 	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/commands/contracts"
 	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/consensus/ethash"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/ethdb/privateapi"
 	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
 	"github.com/ledgerwatch/erigon/turbo/stages"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
@@ -30,8 +36,16 @@ func CreateTestKV(t *testing.T) kv.RwDB {
 	return s.DB
 }
 
-func CreateTestSentry(t *testing.T) (*stages.MockSentry, *core.ChainPack, []*core.ChainPack) {
-	// Configure and generate a sample block chain
+type testAddresses struct {
+	key      *ecdsa.PrivateKey
+	key1     *ecdsa.PrivateKey
+	key2     *ecdsa.PrivateKey
+	address  common.Address
+	address1 common.Address
+	address2 common.Address
+}
+
+func makeTestAddresses() testAddresses {
 	var (
 		key, _   = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		key1, _  = crypto.HexToECDSA("49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee")
@@ -39,8 +53,29 @@ func CreateTestSentry(t *testing.T) (*stages.MockSentry, *core.ChainPack, []*cor
 		address  = crypto.PubkeyToAddress(key.PublicKey)
 		address1 = crypto.PubkeyToAddress(key1.PublicKey)
 		address2 = crypto.PubkeyToAddress(key2.PublicKey)
-		theAddr  = common.Address{1}
-		gspec    = &core.Genesis{
+	)
+
+	return testAddresses{
+		key:      key,
+		key1:     key1,
+		key2:     key2,
+		address:  address,
+		address1: address1,
+		address2: address2,
+	}
+}
+
+func CreateTestSentry(t *testing.T) (*stages.MockSentry, *core.ChainPack, []*core.ChainPack) {
+	addresses := makeTestAddresses()
+	var (
+		key      = addresses.key
+		address  = addresses.address
+		address1 = addresses.address1
+		address2 = addresses.address2
+	)
+
+	var (
+		gspec = &core.Genesis{
 			Config: params.AllEthashProtocolChanges,
 			Alloc: core.GenesisAlloc{
 				address:  {Balance: big.NewInt(9000000000000000000)},
@@ -49,30 +84,80 @@ func CreateTestSentry(t *testing.T) (*stages.MockSentry, *core.ChainPack, []*cor
 			},
 			GasLimit: 10000000,
 		}
-		chainId = big.NewInt(1337)
-		// this code generates a log
-		signer = types.LatestSignerForChainID(nil)
 	)
 	m := stages.MockWithGenesis(t, gspec, key)
 
 	contractBackend := backends.NewSimulatedBackendWithConfig(gspec.Alloc, gspec.Config, gspec.GasLimit)
 	defer contractBackend.Close()
 
-	transactOpts, _ := bind.NewKeyedTransactorWithChainID(key, chainId)
-	transactOpts1, _ := bind.NewKeyedTransactorWithChainID(key1, chainId)
-	transactOpts2, _ := bind.NewKeyedTransactorWithChainID(key2, chainId)
-	var poly *contracts.Poly
-
-	var err error
-	var tokenContract *contracts.Token
 	// Generate empty chain to have some orphaned blocks for tests
 	orphanedChain, err := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 5, func(i int, block *core.BlockGen) {
 	}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// We generate the blocks without plainstant because it's not supported in core.GenerateChain
-	chain, err := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 10, func(i int, block *core.BlockGen) {
+
+	chain, err := getChainInstance(&addresses, m.ChainConfig, m.Genesis, m.Engine, m.DB, contractBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = m.InsertChain(orphanedChain); err != nil {
+		t.Fatal(err)
+	}
+	if err = m.InsertChain(chain); err != nil {
+		t.Fatal(err)
+	}
+
+	return m, chain, []*core.ChainPack{orphanedChain}
+}
+
+var chainInstance *core.ChainPack
+
+func getChainInstance(
+	addresses *testAddresses,
+	config *params.ChainConfig,
+	parent *types.Block,
+	engine consensus.Engine,
+	db kv.RwDB,
+	contractBackend *backends.SimulatedBackend,
+) (*core.ChainPack, error) {
+	var err error
+	if chainInstance == nil {
+		chainInstance, err = generateChain(addresses, config, parent, engine, db, contractBackend)
+	}
+	return chainInstance.Copy(), err
+}
+
+func generateChain(
+	addresses *testAddresses,
+	config *params.ChainConfig,
+	parent *types.Block,
+	engine consensus.Engine,
+	db kv.RwDB,
+	contractBackend *backends.SimulatedBackend,
+) (*core.ChainPack, error) {
+	var (
+		key      = addresses.key
+		key1     = addresses.key1
+		key2     = addresses.key2
+		address  = addresses.address
+		address1 = addresses.address1
+		address2 = addresses.address2
+		theAddr  = common.Address{1}
+		chainId  = big.NewInt(1337)
+		// this code generates a log
+		signer = types.LatestSignerForChainID(nil)
+	)
+
+	transactOpts, _ := bind.NewKeyedTransactorWithChainID(key, chainId)
+	transactOpts1, _ := bind.NewKeyedTransactorWithChainID(key1, chainId)
+	transactOpts2, _ := bind.NewKeyedTransactorWithChainID(key2, chainId)
+	var poly *contracts.Poly
+	var tokenContract *contracts.Token
+
+	// We generate the blocks without plain state because it's not supported in core.GenerateChain
+	return core.GenerateChain(config, parent, engine, db, 10, func(i int, block *core.BlockGen) {
 		var (
 			txn types.Transaction
 			txs []types.Transaction
@@ -190,18 +275,6 @@ func CreateTestSentry(t *testing.T) (*stages.MockSentry, *core.ChainPack, []*cor
 		}
 		contractBackend.Commit()
 	}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err = m.InsertChain(orphanedChain); err != nil {
-		t.Fatal(err)
-	}
-	if err = m.InsertChain(chain); err != nil {
-		t.Fatal(err)
-	}
-
-	return m, chain, []*core.ChainPack{orphanedChain}
 }
 
 type IsMiningMock struct{}
@@ -219,14 +292,16 @@ func CreateTestGrpcConn(t *testing.T, m *stages.MockSentry) (context.Context, *g
 	ethashApi := apis[1].Service.(*ethash.API)
 	server := grpc.NewServer()
 
-	txpool.RegisterTxpoolServer(server, privateapi.NewTxPoolServer(ctx, m.TxPoolP2PServer.TxPool))
+	remote.RegisterETHBACKENDServer(server, privateapi.NewEthBackendServer(ctx, nil, m.DB, m.Notifications.Events, snapshotsync.NewBlockReader(), nil, nil, nil, nil, false))
+	txpool.RegisterTxpoolServer(server, m.TxPoolGrpcServer)
 	txpool.RegisterMiningServer(server, privateapi.NewMiningServer(ctx, &IsMiningMock{}, ethashApi))
+	starknet.RegisterCAIROVMServer(server, &starknet.UnimplementedCAIROVMServer{})
 	listener := bufconn.Listen(1024 * 1024)
 
 	dialer := func() func(context.Context, string) (net.Conn, error) {
 		go func() {
 			if err := server.Serve(listener); err != nil {
-				panic(err)
+				fmt.Printf("%v\n", err)
 			}
 		}()
 		return func(context.Context, string) (net.Conn, error) {
@@ -241,6 +316,7 @@ func CreateTestGrpcConn(t *testing.T, m *stages.MockSentry) (context.Context, *g
 	t.Cleanup(func() {
 		cancel()
 		conn.Close()
+		server.Stop()
 	})
 	return ctx, conn
 }

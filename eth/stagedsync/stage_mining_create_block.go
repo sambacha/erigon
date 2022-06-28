@@ -5,27 +5,32 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/txpool"
+	types2 "github.com/ledgerwatch/erigon-lib/types"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/debug"
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/rawdb"
+	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/eth/ethutils"
 	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/erigon/rlp"
 	"github.com/ledgerwatch/log/v3"
 )
 
 type MiningBlock struct {
 	Header   *types.Header
 	Uncles   []*types.Header
-	Txs      []types.Transaction
+	Txs      types.Transactions
 	Receipts types.Receipts
 
 	LocalTxs  types.TransactionsStream
@@ -33,10 +38,11 @@ type MiningBlock struct {
 }
 
 type MiningState struct {
-	MiningConfig    *params.MiningConfig
-	PendingResultCh chan *types.Block
-	MiningResultCh  chan *types.Block
-	MiningBlock     *MiningBlock
+	MiningConfig      *params.MiningConfig
+	PendingResultCh   chan *types.Block
+	MiningResultCh    chan *types.Block
+	MiningResultPOSCh chan *types.Block
+	MiningBlock       *MiningBlock
 }
 
 func NewMiningState(cfg *params.MiningConfig) MiningState {
@@ -48,36 +54,37 @@ func NewMiningState(cfg *params.MiningConfig) MiningState {
 	}
 }
 
-type MiningCreateBlockCfg struct {
-	db          kv.RwDB
-	miner       MiningState
-	chainConfig params.ChainConfig
-	engine      consensus.Engine
-	txPool      *core.TxPool
-	txPool2     *txpool.TxPool
-	txPool2DB   kv.RoDB
-	tmpdir      string
+func NewProposingState(cfg *params.MiningConfig) MiningState {
+	return MiningState{
+		MiningConfig:      cfg,
+		PendingResultCh:   make(chan *types.Block, 1),
+		MiningResultCh:    make(chan *types.Block, 1),
+		MiningResultPOSCh: make(chan *types.Block, 1),
+		MiningBlock:       &MiningBlock{},
+	}
 }
 
-func StageMiningCreateBlockCfg(
-	db kv.RwDB,
-	miner MiningState,
-	chainConfig params.ChainConfig,
-	engine consensus.Engine,
-	txPool *core.TxPool,
-	txPool2 *txpool.TxPool,
-	txPool2DB kv.RoDB,
-	tmpdir string,
-) MiningCreateBlockCfg {
+type MiningCreateBlockCfg struct {
+	db                     kv.RwDB
+	miner                  MiningState
+	chainConfig            params.ChainConfig
+	engine                 consensus.Engine
+	txPool2                *txpool.TxPool
+	txPool2DB              kv.RoDB
+	tmpdir                 string
+	blockBuilderParameters *core.BlockBuilderParameters
+}
+
+func StageMiningCreateBlockCfg(db kv.RwDB, miner MiningState, chainConfig params.ChainConfig, engine consensus.Engine, txPool2 *txpool.TxPool, txPool2DB kv.RoDB, blockBuilderParameters *core.BlockBuilderParameters, tmpdir string) MiningCreateBlockCfg {
 	return MiningCreateBlockCfg{
-		db:          db,
-		miner:       miner,
-		chainConfig: chainConfig,
-		engine:      engine,
-		txPool:      txPool,
-		txPool2:     txPool2,
-		txPool2DB:   txPool2DB,
-		tmpdir:      tmpdir,
+		db:                     db,
+		miner:                  miner,
+		chainConfig:            chainConfig,
+		engine:                 engine,
+		txPool2:                txPool2,
+		txPool2DB:              txPool2DB,
+		tmpdir:                 tmpdir,
+		blockBuilderParameters: blockBuilderParameters,
 	}
 }
 
@@ -86,17 +93,13 @@ func StageMiningCreateBlockCfg(
 // - resubmitAdjustCh - variable is not implemented
 func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBlockCfg, quit <-chan struct{}) (err error) {
 	current := cfg.miner.MiningBlock
-	txPoolLocals := cfg.txPool.Locals()
+	txPoolLocals := []common.Address{} //txPoolV2 has no concept of local addresses (yet?)
 	coinbase := cfg.miner.MiningConfig.Etherbase
 
 	const (
 		// staleThreshold is the maximum depth of the acceptable stale block.
 		staleThreshold = 7
 	)
-
-	if cfg.miner.MiningConfig.Etherbase == (common.Address{}) {
-		return fmt.Errorf("refusing to mine without etherbase")
-	}
 
 	logPrefix := s.LogPrefix()
 	executionAt, err := s.ExecutionAt(tx)
@@ -105,67 +108,60 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 	}
 	parent := rawdb.ReadHeaderByNumber(tx, executionAt)
 	if parent == nil { // todo: how to return error and don't stop Erigon?
-		return fmt.Errorf(fmt.Sprintf("[%s] Empty block", logPrefix), "blocknum", executionAt)
+		return fmt.Errorf("empty block %d", executionAt)
 	}
-	log.Info(fmt.Sprintf("[%s] Start mine", logPrefix), "block", executionAt+1)
+
+	if cfg.blockBuilderParameters != nil && cfg.blockBuilderParameters.ParentHash != parent.Hash() {
+		return fmt.Errorf("wrong head block: %x (current) vs %x (requested)", parent.Hash(), cfg.blockBuilderParameters.ParentHash)
+	}
+
+	isTrans, err := rawdb.Transitioned(tx, executionAt, cfg.chainConfig.TerminalTotalDifficulty)
+	if err != nil {
+		return err
+	}
+
+	if cfg.miner.MiningConfig.Etherbase == (common.Address{}) {
+		if !isTrans {
+			return fmt.Errorf("refusing to mine without etherbase")
+		}
+		// If we do not have an etherbase, let's use the suggested one
+		coinbase = cfg.blockBuilderParameters.SuggestedFeeRecipient
+	}
 
 	blockNum := executionAt + 1
-	if cfg.txPool2 != nil {
-		txSlots := txpool.TxsRlp{}
-		if err = cfg.txPool2DB.View(context.Background(), func(tx kv.Tx) error {
-			if err := cfg.txPool2.Best(200, &txSlots, tx); err != nil {
-				return err
-			}
-			for i := 0; i < len(txSlots.Txs); i++ {
-				txSlots.Txs[i] = common.CopyBytes(txSlots.Txs[i]) // because we need this data outside of tx
-			}
-			return nil
-		}); err != nil {
+	var txs []types.Transaction
+	if err = cfg.txPool2DB.View(context.Background(), func(tx kv.Tx) error {
+		txSlots := types2.TxsRlp{}
+		if err := cfg.txPool2.Best(200, &txSlots, tx); err != nil {
 			return err
 		}
-		txs, err := types.DecodeTransactions(txSlots.Txs)
-		if err != nil {
-			return fmt.Errorf("decode rlp of pending txs: %w", err)
+
+		for i := range txSlots.Txs {
+			s := rlp.NewStream(bytes.NewReader(txSlots.Txs[i]), uint64(len(txSlots.Txs[i])))
+
+			transaction, err := types.DecodeTransaction(s)
+			if err == io.EOF {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			txs = append(txs, transaction)
 		}
 		var sender common.Address
 		for i := range txs {
 			copy(sender[:], txSlots.Senders.At(i))
 			txs[i].SetSender(sender)
 		}
-		current.RemoteTxs = types.NewTransactionsFixedOrder(txs)
-		// txpool v2 - doesn't prioritise local txs over remote
-		current.LocalTxs = types.NewTransactionsFixedOrder(nil)
-	} else {
-		pendingTxs, err := cfg.txPool.Pending()
-		if err != nil {
-			return err
-		}
-		// Split the pending transactions into locals and remotes
-		localTxs, remoteTxs := types.TransactionsGroupedBySender{}, types.TransactionsGroupedBySender{}
-		signer := types.MakeSigner(&cfg.chainConfig, blockNum)
-		for _, txs := range pendingTxs {
-			if len(txs) == 0 {
-				continue
-			}
-			from, _ := txs[0].Sender(*signer)
-			isLocal := false
-			for _, local := range txPoolLocals {
-				if local == from {
-					isLocal = true
-					break
-				}
-			}
 
-			if isLocal {
-				localTxs = append(localTxs, txs)
-			} else {
-				remoteTxs = append(remoteTxs, txs)
-			}
-		}
-
-		current.LocalTxs = types.NewTransactionsByPriceAndNonce(*signer, localTxs)
-		current.RemoteTxs = types.NewTransactionsByPriceAndNonce(*signer, remoteTxs)
+		return nil
+	}); err != nil {
+		return err
 	}
+	current.RemoteTxs = types.NewTransactionsFixedOrder(txs)
+	// txpool v2 - doesn't prioritise local txs over remote
+	current.LocalTxs = types.NewTransactionsFixedOrder(nil)
+	log.Debug(fmt.Sprintf("[%s] Candidate txs", logPrefix), "amount", len(txs))
 	localUncles, remoteUncles, err := readNonCanonicalHeaders(tx, blockNum, cfg.engine, coinbase, txPoolLocals)
 	if err != nil {
 		return err
@@ -202,25 +198,27 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 	}
 
 	// re-written miner/worker.go:commitNewWork
-	timestamp := time.Now().Unix()
-	if parent.Time >= uint64(timestamp) {
-		timestamp = int64(parent.Time + 1)
-	}
-	num := parent.Number
-	header := &types.Header{
-		ParentHash: parent.Hash(),
-		Number:     num.Add(num, common.Big1),
-		GasLimit:   core.CalcGasLimit(parent.GasUsed, parent.GasLimit, cfg.miner.MiningConfig.GasFloor, cfg.miner.MiningConfig.GasCeil),
-		Extra:      cfg.miner.MiningConfig.ExtraData,
-		Time:       uint64(timestamp),
+	var timestamp uint64
+	if !isTrans {
+		timestamp = uint64(time.Now().Unix())
+		if parent.Time >= timestamp {
+			timestamp = parent.Time + 1
+		}
+	} else {
+		// If we are on proof-of-stake timestamp should be already set for us
+		timestamp = cfg.blockBuilderParameters.Timestamp
 	}
 
-	// Only set the coinbase if our consensus engine is running (avoid spurious block rewards)
-	//if w.isRunning() {
+	header := core.MakeEmptyHeader(parent, &cfg.chainConfig, timestamp, &cfg.miner.MiningConfig.GasLimit)
 	header.Coinbase = coinbase
-	//}
+	header.Extra = cfg.miner.MiningConfig.ExtraData
 
-	if err = cfg.engine.Prepare(chain, header); err != nil {
+	log.Info(fmt.Sprintf("[%s] Start mine", logPrefix), "block", executionAt+1, "baseFee", header.BaseFee, "gasLimit", header.GasLimit)
+
+	stateReader := state.NewPlainStateReader(tx)
+	ibs := state.New(stateReader)
+
+	if err = cfg.engine.Prepare(chain, header, ibs); err != nil {
 		log.Error("Failed to prepare header for mining",
 			"err", err,
 			"headerNumber", header.Number.Uint64(),
@@ -232,6 +230,14 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 		return err
 	}
 
+	if isTrans {
+		header.MixDigest = cfg.blockBuilderParameters.PrevRandao
+
+		current.Header = header
+		current.Uncles = nil
+		return nil
+	}
+
 	// If we are care about TheDAO hard-fork check whether to override the extra-data or not
 	if daoBlock := cfg.chainConfig.DAOForkBlock; daoBlock != nil {
 		// Check whether the block is among the fork extra-override range
@@ -239,7 +245,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 		if header.Number.Cmp(daoBlock) >= 0 && header.Number.Cmp(limit) < 0 {
 			// Depending whether we support or oppose the fork, override differently
 			if cfg.chainConfig.DAOForkSupport {
-				header.Extra = common.CopyBytes(params.DAOForkBlockExtra)
+				header.Extra = libcommon.Copy(params.DAOForkBlockExtra)
 			} else if bytes.Equal(header.Extra, params.DAOForkBlockExtra) {
 				header.Extra = []byte{} // If miner opposes, don't let it use the reserved extra-data
 			}
@@ -267,6 +273,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 		})
 		return uncles
 	}
+
 	// when 08 is processed ancestors contain 07 (quick block)
 	for _, ancestor := range GetBlocksFromHash(parent.Hash(), 7) {
 		for _, uncle := range ancestor.Uncles() {
@@ -310,7 +317,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 			if err = commitUncle(env, uncle); err != nil {
 				log.Trace("Possible uncle rejected", "hash", hash, "reason", err)
 			} else {
-				log.Debug("Committing new uncle to block", "hash", hash)
+				log.Trace("Committing new uncle to block", "hash", hash)
 				uncles = append(uncles, uncle)
 			}
 		}

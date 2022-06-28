@@ -15,12 +15,11 @@ import (
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
-	//grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/holiman/uint256"
+	common2 "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces"
 	proto_cons "github.com/ledgerwatch/erigon-lib/gointerfaces/consensus"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/cmd/utils"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus/clique"
 	"github.com/ledgerwatch/erigon/core"
@@ -39,7 +38,7 @@ var configs embed.FS
 
 func init() {
 	withApiAddr(cliqueCmd)
-	withDatadir(cliqueCmd)
+	withDataDir(cliqueCmd)
 	withConfig(cliqueCmd)
 	rootCmd.AddCommand(cliqueCmd)
 }
@@ -48,7 +47,7 @@ var cliqueCmd = &cobra.Command{
 	Use:   "clique",
 	Short: "Run clique consensus engine",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, _ := utils.RootContext()
+		ctx, _ := common2.RootContext()
 		logger := log.New()
 		return cliqueEngine(ctx, logger)
 	},
@@ -85,8 +84,8 @@ func cliqueEngine(ctx context.Context, logger log.Logger) error {
 			return err
 		}
 	}
-	server.db = openDB(filepath.Join(datadir, "clique", "db"), logger)
-	server.c = clique.New(server.chainConfig, &params.SnapshotConfig{}, server.db)
+	server.db = openDB(filepath.Join(datadirCli, "clique", "db"), logger)
+	server.c = clique.New(server.chainConfig, params.CliqueSnapshot, server.db)
 	<-ctx.Done()
 	return nil
 }
@@ -228,10 +227,9 @@ func (cs *CliqueServerImpl) initAndConfig(configuration []byte) error {
 		case "homestead":
 			chainConfig.HomesteadBlock = bigNumber
 		case "tangerine":
-			chainConfig.EIP150Block = bigNumber
+			chainConfig.TangerineWhistleBlock = bigNumber
 		case "spurious":
-			chainConfig.EIP155Block = bigNumber
-			chainConfig.EIP158Block = bigNumber
+			chainConfig.SpuriousDragonBlock = bigNumber
 		case "byzantium":
 			chainConfig.ByzantiumBlock = bigNumber
 		case "constantinople":

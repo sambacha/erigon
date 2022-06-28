@@ -24,19 +24,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	"github.com/ledgerwatch/log/v3"
 )
 
-func init() {
-	log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StderrHandler))
-}
 func TestClientRequest(t *testing.T) {
 	server := newTestServer()
 	defer server.Stop()
@@ -259,10 +256,8 @@ func TestClientSubscribeInvalidArg(t *testing.T) {
 			}
 			if !shouldPanic && err != nil {
 				t.Errorf("EthSubscribe shouldn't have panicked for %#v", arg)
-				buf := make([]byte, 1024*1024)
-				buf = buf[:runtime.Stack(buf, false)]
 				t.Error(err)
-				t.Error(string(buf))
+				t.Error(dbg.Stack())
 			}
 		}()
 		client.EthSubscribe(context.Background(), arg, "foo_bar")
@@ -513,7 +508,7 @@ func TestClientReconnect(t *testing.T) {
 		if err != nil {
 			t.Fatal("can't listen:", err)
 		}
-		go http.Serve(l, srv.WebsocketHandler([]string{"*"}, false))
+		go http.Serve(l, srv.WebsocketHandler([]string{"*"}, nil, false))
 		return srv, l
 	}
 
@@ -578,7 +573,7 @@ func httpTestClient(srv *Server, transport string, fl *flakeyListener) (*Client,
 	var hs *httptest.Server
 	switch transport {
 	case "ws":
-		hs = httptest.NewUnstartedServer(srv.WebsocketHandler([]string{"*"}, false))
+		hs = httptest.NewUnstartedServer(srv.WebsocketHandler([]string{"*"}, nil, false))
 	case "http":
 		hs = httptest.NewUnstartedServer(srv)
 	default:
@@ -613,7 +608,7 @@ func (l *flakeyListener) Accept() (net.Conn, error) {
 	if err == nil {
 		timeout := time.Duration(rand.Int63n(int64(l.maxKillTimeout)))
 		time.AfterFunc(timeout, func() {
-			log.Debug(fmt.Sprintf("killing conn %v after %v", c.LocalAddr(), timeout))
+			log.Trace(fmt.Sprintf("killing conn %v after %v", c.LocalAddr(), timeout))
 			c.Close()
 		})
 	}

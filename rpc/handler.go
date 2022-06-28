@@ -64,11 +64,13 @@ type handler struct {
 	log            log.Logger
 	allowSubscribe bool
 
-	allowList AllowList // a list of explicitly allowed methods, if empty -- everything is allowed
+	allowList     AllowList // a list of explicitly allowed methods, if empty -- everything is allowed
+	forbiddenList ForbiddenList
 
 	subLock             sync.Mutex
 	serverSubs          map[ID]*Subscription
 	maxBatchConcurrency uint
+	traceRequests       bool
 }
 
 type callProc struct {
@@ -76,8 +78,9 @@ type callProc struct {
 	notifiers []*Notifier
 }
 
-func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *serviceRegistry, allowList AllowList, maxBatchConcurrency uint) *handler {
+func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *serviceRegistry, allowList AllowList, maxBatchConcurrency uint, traceRequests bool) *handler {
 	rootCtx, cancelRoot := context.WithCancel(connCtx)
+	forbiddenList := newForbiddenList()
 	h := &handler{
 		reg:            reg,
 		idgen:          idgen,
@@ -90,9 +93,12 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
 		serverSubs:     make(map[ID]*Subscription),
 		log:            log.Root(),
 		allowList:      allowList,
+		forbiddenList:  forbiddenList,
 
 		maxBatchConcurrency: maxBatchConcurrency,
+		traceRequests:       traceRequests,
 	}
+
 	if conn.remoteAddr() != "" {
 		h.log = h.log.New("conn", conn.remoteAddr())
 	}
@@ -101,7 +107,7 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
 }
 
 // handleBatch executes all messages in a batch and returns the responses.
-func (h *handler) handleBatch(msgs []*jsonrpcMessage, stream *jsoniter.Stream) {
+func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 	// Emit error response for empty batches:
 	if len(msgs) == 0 {
 		h.startCallProc(func(cp *callProc) {
@@ -172,26 +178,19 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage, stream *jsoniter.Stream) {
 }
 
 // handleMsg handles a single message.
-func (h *handler) handleMsg(msg *jsonrpcMessage, stream *jsoniter.Stream) {
+func (h *handler) handleMsg(msg *jsonrpcMessage) {
 	if ok := h.handleImmediate(msg); ok {
 		return
 	}
 	h.startCallProc(func(cp *callProc) {
-		needWriteStream := false
-		if stream == nil {
-			stream = jsoniter.NewStream(jsoniter.ConfigDefault, nil, 4096)
-			needWriteStream = true
-		}
+		stream := jsoniter.NewStream(jsoniter.ConfigDefault, nil, 4096)
 		answer := h.handleCallMsg(cp, msg, stream)
 		h.addSubscriptions(cp.notifiers)
 		if answer != nil {
-			buffer, _ := json.Marshal(answer)
-			stream.Write(json.RawMessage(buffer))
-		}
-		if needWriteStream {
-			h.conn.writeJSON(cp.ctx, json.RawMessage(stream.Buffer()))
+			h.conn.writeJSON(cp.ctx, answer)
 		} else {
-			stream.Write([]byte("\n"))
+			_ = stream.Flush()
+			h.conn.writeJSON(cp.ctx, json.RawMessage(stream.Buffer()))
 		}
 		for _, n := range cp.notifiers {
 			n.activate()
@@ -303,7 +302,7 @@ func (h *handler) handleImmediate(msg *jsonrpcMessage) bool {
 func (h *handler) handleSubscriptionResult(msg *jsonrpcMessage) {
 	var result subscriptionResult
 	if err := json.Unmarshal(msg.Params, &result); err != nil {
-		h.log.Debug("Dropping invalid subscription message")
+		h.log.Trace("Dropping invalid subscription message")
 		return
 	}
 	if h.clientSubs[result.ID] != nil {
@@ -315,7 +314,7 @@ func (h *handler) handleSubscriptionResult(msg *jsonrpcMessage) {
 func (h *handler) handleResponse(msg *jsonrpcMessage) {
 	op := h.respWait[string(msg.ID)]
 	if op == nil {
-		h.log.Debug("Unsolicited RPC response", "reqid", idForLog{msg.ID})
+		h.log.Trace("Unsolicited RPC response", "reqid", idForLog{msg.ID})
 		return
 	}
 	delete(h.respWait, string(msg.ID))
@@ -344,7 +343,11 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage, stream *json
 	switch {
 	case msg.isNotification():
 		h.handleCall(ctx, msg, stream)
-		h.log.Debug("Served", "t", time.Since(start), "method", msg.Method, "params", string(msg.Params))
+		if h.traceRequests {
+			h.log.Info("Served", "t", time.Since(start), "method", msg.Method, "params", string(msg.Params))
+		} else {
+			h.log.Trace("Served", "t", time.Since(start), "method", msg.Method, "params", string(msg.Params))
+		}
 		return nil
 	case msg.isCall():
 		resp := h.handleCall(ctx, msg, stream)
@@ -357,7 +360,11 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage, stream *json
 					"err", resp.Error.Message)
 			}
 		}
-		h.log.Debug("Served", "t", time.Since(start), "method", msg.Method, "reqid", idForLog{msg.ID}, "params", string(msg.Params))
+		if h.traceRequests {
+			h.log.Info("Served", "t", time.Since(start), "method", msg.Method, "reqid", idForLog{msg.ID}, "params", string(msg.Params))
+		} else {
+			h.log.Trace("Served", "t", time.Since(start), "method", msg.Method, "reqid", idForLog{msg.ID}, "params", string(msg.Params))
+		}
 		return resp
 	case msg.hasValidID():
 		return msg.errorResponse(&invalidRequestError{"invalid request"})
@@ -367,9 +374,14 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage, stream *json
 }
 
 func (h *handler) isMethodAllowedByGranularControl(method string) bool {
+	_, isForbidden := h.forbiddenList[method]
 	if len(h.allowList) == 0 {
+		if isForbidden {
+			return false
+		}
 		return true
 	}
+
 	_, ok := h.allowList[method]
 	return ok
 }

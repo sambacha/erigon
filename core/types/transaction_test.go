@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"reflect"
 	"testing"
@@ -32,6 +33,7 @@ import (
 	"github.com/ledgerwatch/erigon/common/u256"
 	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/rlp"
+	"github.com/stretchr/testify/assert"
 )
 
 // The values in those tests are from the Transaction Tests
@@ -78,13 +80,13 @@ var (
 	)
 
 	dynFeeTx = &DynamicFeeTransaction{
-		ChainID: u256.Num1,
 		CommonTx: CommonTx{
-			Nonce: 3,
-			To:    &testAddr,
-			Value: uint256.NewInt(10),
-			Gas:   25000,
-			Data:  common.FromHex("5544"),
+			ChainID: u256.Num1,
+			Nonce:   3,
+			To:      &testAddr,
+			Value:   uint256.NewInt(10),
+			Gas:     25000,
+			Data:    common.FromHex("5544"),
 		},
 		Tip:    uint256.NewInt(1),
 		FeeCap: uint256.NewInt(1),
@@ -95,6 +97,14 @@ var (
 		common.Hex2Bytes("c9519f4f2b30335884581971573fadf60c6204f59a911df35ee8a540456b266032f1e8e2c5dd761f9e4f88f41c8310aeaba26a8bfcdacfedfa12ec3862d3752101"),
 	)
 )
+
+func TestDecodeEmptyInput(t *testing.T) {
+	input := []byte{}
+	_, err := DecodeTransaction(rlp.NewStream(bytes.NewReader(input), 0))
+	if !errors.Is(err, io.EOF) {
+		t.Fatal("wrong error:", err)
+	}
+}
 
 func TestDecodeEmptyTypedTx(t *testing.T) {
 	input := []byte{0x80}
@@ -122,6 +132,7 @@ func TestTransactionEncode(t *testing.T) {
 	if !bytes.Equal(txb, should) {
 		t.Errorf("encoded RLP mismatch, got %x", txb)
 	}
+	assert.False(t, TypedTransactionMarshalledAsRlpString(txb))
 }
 
 func TestEIP2718TransactionSigHash(t *testing.T) {
@@ -226,6 +237,7 @@ func TestEIP2718TransactionEncode(t *testing.T) {
 		if !bytes.Equal(have, want) {
 			t.Errorf("encoded RLP mismatch, got %x", have)
 		}
+		assert.True(t, TypedTransactionMarshalledAsRlpString(have))
 	}
 	// Binary representation
 	{
@@ -238,6 +250,7 @@ func TestEIP2718TransactionEncode(t *testing.T) {
 		if !bytes.Equal(have, want) {
 			t.Errorf("encoded RLP mismatch, got %x", have)
 		}
+		assert.False(t, TypedTransactionMarshalledAsRlpString(have))
 	}
 }
 func TestEIP1559TransactionEncode(t *testing.T) {
@@ -255,6 +268,7 @@ func TestEIP1559TransactionEncode(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode error: %v", err)
 		}
+		assert.False(t, TypedTransactionMarshalledAsRlpString(have))
 	}
 }
 

@@ -29,6 +29,7 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/crypto"
+	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rlp"
 )
 
@@ -44,6 +45,7 @@ const (
 	LegacyTxType = iota
 	AccessListTxType
 	DynamicFeeTxType
+	StarknetType
 )
 
 // Transaction is an Ethereum transaction.
@@ -60,7 +62,7 @@ type Transaction interface {
 	GetValue() *uint256.Int
 	Time() time.Time
 	GetTo() *common.Address
-	AsMessage(s Signer, baseFee *big.Int) (Message, error)
+	AsMessage(s Signer, baseFee *big.Int, rules *params.Rules) (Message, error)
 	WithSignature(signer Signer, sig []byte) (Transaction, error)
 	FakeSign(address common.Address) (Transaction, error)
 	Hash() common.Hash
@@ -81,6 +83,8 @@ type Transaction interface {
 	Sender(Signer) (common.Address, error)
 	GetSender() (common.Address, bool)
 	SetSender(common.Address)
+	IsContractDeploy() bool
+	IsStarkNet() bool
 }
 
 // TransactionMisc is collection of miscelaneous fields for transaction that is supposed to be embedded into concrete
@@ -92,6 +96,16 @@ type TransactionMisc struct {
 	hash atomic.Value //nolint:structcheck
 	size atomic.Value //nolint:structcheck
 	from atomic.Value
+}
+
+type RawTransactions [][]byte
+
+func (t RawTransactions) Len() int {
+	return len(t)
+}
+
+func (t RawTransactions) EncodeIndex(i int, w *bytes.Buffer) {
+	w.Write(t[i])
 }
 
 func (tm TransactionMisc) Time() time.Time {
@@ -122,7 +136,7 @@ func DecodeTransaction(s *rlp.Stream) (Transaction, error) {
 		return nil, err
 	}
 	if len(b) != 1 {
-		return nil, fmt.Errorf("only 1-byte tx type prefix is supported, got %d bytes", len(b))
+		return nil, fmt.Errorf("%w, got %d bytes", rlp.ErrWrongTxTypePrefix, len(b))
 	}
 	var tx Transaction
 	switch b[0] {
@@ -138,8 +152,14 @@ func DecodeTransaction(s *rlp.Stream) (Transaction, error) {
 			return nil, err
 		}
 		tx = t
+	case StarknetType:
+		t := &StarknetTransaction{}
+		if err = t.DecodeRLP(s); err != nil {
+			return nil, err
+		}
+		tx = t
 	default:
-		return nil, fmt.Errorf("unknown tx type prefix: %d", b[0])
+		return nil, fmt.Errorf("%w, got: %d", rlp.ErrUnknownTxTypePrefix, b[0])
 	}
 	if kind == rlp.String {
 		if err = s.ListEnd(); err != nil {
@@ -184,6 +204,11 @@ func DecodeTransactions(txs [][]byte) ([]Transaction, error) {
 		}
 	}
 	return result, nil
+}
+
+func TypedTransactionMarshalledAsRlpString(data []byte) bool {
+	// Unless it's a single byte, serialized RLP strings have their first byte in the [0x80, 0xc0) range
+	return len(data) > 0 && 0x80 <= data[0] && data[0] < 0xc0
 }
 
 func sanityCheckSignature(v *uint256.Int, r *uint256.Int, s *uint256.Int, maybeProtected bool) error {

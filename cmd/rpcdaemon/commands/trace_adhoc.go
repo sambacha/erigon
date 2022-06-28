@@ -17,12 +17,10 @@ import (
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	math2 "github.com/ledgerwatch/erigon/common/math"
 	"github.com/ledgerwatch/erigon/core"
-	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/core/vm"
-	"github.com/ledgerwatch/erigon/core/vm/stack"
 	"github.com/ledgerwatch/erigon/ethdb"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
@@ -194,7 +192,7 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 			}
 			// Backfill the legacy gasPrice for EVM execution, unless we're all zeroes
 			gasPrice = new(uint256.Int)
-			if gasFeeCap.BitLen() > 0 || gasTipCap.BitLen() > 0 {
+			if !gasFeeCap.IsZero() || !gasTipCap.IsZero() {
 				gasPrice = math2.U256Min(new(uint256.Int).Add(gasTipCap, baseFee), gasFeeCap)
 			} else {
 				// This means gasFeeCap == 0, gasTipCap == 0
@@ -207,7 +205,7 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 	if args.Value != nil {
 		overflow := value.SetFromBig(args.Value.ToInt())
 		if overflow {
-			panic(fmt.Errorf("args.Value higher than 2^256-1"))
+			return types.Message{}, fmt.Errorf("args.Value higher than 2^256-1")
 		}
 	}
 	var data []byte
@@ -240,7 +238,8 @@ type OeTracer struct {
 	idx          []string     // Prefix for the "idx" inside operations, for easier navigation
 }
 
-func (ot *OeTracer) CaptureStart(depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) error {
+func (ot *OeTracer) CaptureStart(env *vm.EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) {
+	//fmt.Printf("CaptureStart depth %d, from %x, to %x, create %t, input %x, gas %d, value %d, precompile %t\n", depth, from, to, create, input, gas, value, precompile)
 	if ot.r.VmTrace != nil {
 		var vmTrace *VmTrace
 		if depth > 0 {
@@ -270,14 +269,13 @@ func (ot *OeTracer) CaptureStart(depth int, from common.Address, to common.Addre
 			vmTrace.Code = code
 		}
 	}
-	if precompile && depth > 0 {
+	if precompile && depth > 0 && value.Sign() <= 0 {
 		ot.precompile = true
-		return nil
+		return
 	}
 	if gas > 500000000 {
 		gas = 500000001 - (0x8000000000000000 - gas)
 	}
-	//fmt.Printf("CaptureStart depth %d, from %x, to %x, create %t, input %x, gas %d, value %d\n", depth, from, to, create, input, gas, value)
 	trace := &ParityTrace{}
 	if create {
 		trResult := &CreateTraceResult{}
@@ -336,10 +334,9 @@ func (ot *OeTracer) CaptureStart(depth int, from common.Address, to common.Addre
 	}
 	ot.r.Trace = append(ot.r.Trace, trace)
 	ot.traceStack = append(ot.traceStack, trace)
-	return nil
 }
 
-func (ot *OeTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) error {
+func (ot *OeTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) {
 	if ot.r.VmTrace != nil {
 		if len(ot.vmOpStack) > 0 {
 			ot.lastOffStack = ot.vmOpStack[len(ot.vmOpStack)-1]
@@ -357,7 +354,7 @@ func (ot *OeTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64
 	}
 	if ot.precompile {
 		ot.precompile = false
-		return nil
+		return
 	}
 	if depth == 0 {
 		ot.r.Output = common.CopyBytes(output)
@@ -368,26 +365,38 @@ func (ot *OeTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64
 		ignoreError = depth == 0 && topTrace.Type == CREATE
 	}
 	if err != nil && !ignoreError {
-		switch err {
-		case vm.ErrInvalidJump:
-			topTrace.Error = "Bad jump destination"
-		case vm.ErrContractAddressCollision, vm.ErrCodeStoreOutOfGas, vm.ErrOutOfGas, vm.ErrGasUintOverflow:
-			topTrace.Error = "Out of gas"
-		case vm.ErrExecutionReverted:
+		if err == vm.ErrExecutionReverted {
 			topTrace.Error = "Reverted"
-		case vm.ErrWriteProtection:
-			topTrace.Error = "Mutable Call In Static Context"
-		default:
-			switch err.(type) {
-			case *vm.ErrStackUnderflow:
-				topTrace.Error = "Stack underflow"
-			case *vm.ErrInvalidOpCode:
-				topTrace.Error = "Bad instruction"
+			switch topTrace.Type {
+			case CALL:
+				topTrace.Result.(*TraceResult).GasUsed = new(hexutil.Big)
+				topTrace.Result.(*TraceResult).GasUsed.ToInt().SetUint64(startGas - endGas)
+				topTrace.Result.(*TraceResult).Output = common.CopyBytes(output)
+			case CREATE:
+				topTrace.Result.(*CreateTraceResult).GasUsed = new(hexutil.Big)
+				topTrace.Result.(*CreateTraceResult).GasUsed.ToInt().SetUint64(startGas - endGas)
+				topTrace.Result.(*CreateTraceResult).Code = common.CopyBytes(output)
+			}
+		} else {
+			topTrace.Result = nil
+			switch err {
+			case vm.ErrInvalidJump:
+				topTrace.Error = "Bad jump destination"
+			case vm.ErrContractAddressCollision, vm.ErrCodeStoreOutOfGas, vm.ErrOutOfGas, vm.ErrGasUintOverflow:
+				topTrace.Error = "Out of gas"
+			case vm.ErrWriteProtection:
+				topTrace.Error = "Mutable Call In Static Context"
 			default:
-				topTrace.Error = err.Error()
+				switch err.(type) {
+				case *vm.ErrStackUnderflow:
+					topTrace.Error = "Stack underflow"
+				case *vm.ErrInvalidOpCode:
+					topTrace.Error = "Bad instruction"
+				default:
+					topTrace.Error = err.Error()
+				}
 			}
 		}
-		topTrace.Result = nil
 	} else {
 		if len(output) > 0 {
 			switch topTrace.Type {
@@ -410,10 +419,12 @@ func (ot *OeTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64
 	if depth > 0 {
 		ot.traceAddr = ot.traceAddr[:len(ot.traceAddr)-1]
 	}
-	return nil
 }
 
-func (ot *OeTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, st *stack.Stack, rData []byte, contract *vm.Contract, opDepth int, err error) error {
+func (ot *OeTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, opDepth int, err error) {
+	memory := scope.Memory
+	st := scope.Stack
+
 	if ot.r.VmTrace != nil {
 		var vmTrace *VmTrace
 		if len(ot.vmOpStack) > 0 {
@@ -471,7 +482,7 @@ func (ot *OeTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost
 		}
 		if ot.lastOp == vm.STOP && op == vm.STOP && len(ot.vmOpStack) == 0 {
 			// Looks like OE is "optimising away" the second STOP
-			return nil
+			return
 		}
 		ot.lastVmOp = &VmTraceOp{Ex: &VmTraceEx{}}
 		vmTrace.Ops = append(vmTrace.Ops, ot.lastVmOp)
@@ -517,11 +528,9 @@ func (ot *OeTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost
 			ot.lastVmOp.Ex = nil
 		}
 	}
-	return nil
 }
 
-func (ot *OeTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, contract *vm.Contract, opDepth int, err error) error {
-	return nil
+func (ot *OeTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, opDepth int, err error) {
 }
 
 func (ot *OeTracer) CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int) {
@@ -698,30 +707,29 @@ func (api *TraceAPIImpl) ReplayTransaction(ctx context.Context, txHash common.Ha
 		return nil, err
 	}
 
-	blockNumber, err := rawdb.ReadTxLookupEntry(tx, txHash)
+	blockNum, ok, err := api.txnLookup(ctx, tx, txHash)
 	if err != nil {
 		return nil, err
 	}
-	if blockNumber == nil {
-		return nil, nil // not error, see https://github.com/ledgerwatch/erigon/issues/1645
+	if !ok {
+		return nil, nil
 	}
-
-	// Extract transactions from block
-	block, bErr := api.blockByNumberWithSenders(tx, *blockNumber)
-	if bErr != nil {
-		return nil, bErr
+	block, err := api.blockByNumberWithSenders(tx, blockNum)
+	if err != nil {
+		return nil, err
 	}
 	if block == nil {
-		return nil, fmt.Errorf("could not find block  %d", *blockNumber)
+		return nil, nil
 	}
-	var txIndex int
-	for idx, txn := range block.Transactions() {
-		if txn.Hash() == txHash {
-			txIndex = idx
+	var txnIndex uint64
+	for i, transaction := range block.Transactions() {
+		if transaction.Hash() == txHash {
+			txnIndex = uint64(i)
 			break
 		}
 	}
-	bn := hexutil.Uint64(*blockNumber)
+
+	bn := hexutil.Uint64(blockNum)
 
 	parentNr := bn
 	if parentNr > 0 {
@@ -729,7 +737,7 @@ func (api *TraceAPIImpl) ReplayTransaction(ctx context.Context, txHash common.Ha
 	}
 
 	// Returns an array of trace arrays, one trace array for each transaction
-	traces, err := api.callManyTransactions(ctx, tx, block.Transactions(), traceTypes, block.ParentHash(), rpc.BlockNumber(parentNr), block.Header(), txIndex, types.MakeSigner(chainConfig, *blockNumber))
+	traces, err := api.callManyTransactions(ctx, tx, block.Transactions(), traceTypes, block.ParentHash(), rpc.BlockNumber(parentNr), block.Header(), int(txnIndex), types.MakeSigner(chainConfig, blockNum), chainConfig.Rules(blockNum))
 	if err != nil {
 		return nil, err
 	}
@@ -751,7 +759,7 @@ func (api *TraceAPIImpl) ReplayTransaction(ctx context.Context, txHash common.Ha
 
 	for txno, trace := range traces {
 		// We're only looking for a specific transaction
-		if txno == txIndex {
+		if txno == int(txnIndex) {
 			result.Output = trace.Output
 			if traceTypeTrace {
 				result.Trace = trace.Trace
@@ -781,7 +789,7 @@ func (api *TraceAPIImpl) ReplayBlockTransactions(ctx context.Context, blockNrOrH
 		return nil, err
 	}
 
-	blockNumber, _, err := rpchelper.GetBlockNumber(blockNrOrHash, tx, api.filters)
+	blockNumber, _, _, err := rpchelper.GetBlockNumber(blockNrOrHash, tx, api.filters)
 	if err != nil {
 		return nil, err
 	}
@@ -813,7 +821,7 @@ func (api *TraceAPIImpl) ReplayBlockTransactions(ctx context.Context, blockNrOrH
 	}
 
 	// Returns an array of trace arrays, one trace array for each transaction
-	traces, err := api.callManyTransactions(ctx, tx, block.Transactions(), traceTypes, block.ParentHash(), rpc.BlockNumber(parentNr), block.Header(), -1 /* all tx indices */, types.MakeSigner(chainConfig, blockNumber))
+	traces, err := api.callManyTransactions(ctx, tx, block.Transactions(), traceTypes, block.ParentHash(), rpc.BlockNumber(parentNr), block.Header(), -1 /* all tx indices */, types.MakeSigner(chainConfig, blockNumber), chainConfig.Rules(blockNumber))
 	if err != nil {
 		return nil, err
 	}
@@ -858,12 +866,13 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		var num = rpc.LatestBlockNumber
 		blockNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-	blockNumber, hash, err := rpchelper.GetBlockNumber(*blockNrOrHash, tx, api.filters)
+
+	blockNumber, hash, latest, err := rpchelper.GetBlockNumber(*blockNrOrHash, tx, api.filters)
 	if err != nil {
 		return nil, err
 	}
 	var stateReader state.StateReader
-	if num, ok := blockNrOrHash.Number(); ok && num == rpc.LatestBlockNumber {
+	if latest {
 		cacheView, err := api.stateCache.View(ctx, tx)
 		if err != nil {
 			return nil, err
@@ -874,10 +883,14 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 	}
 	ibs := state.New(stateReader)
 
-	header := rawdb.ReadHeader(tx, hash, blockNumber)
-	if header == nil {
+	block, err := api.blockWithSenders(tx, hash, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	if block == nil {
 		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
 	}
+	header := block.Header()
 
 	// Setup context so it may be cancelled the call has completed
 	// or, in case of unmetered gas, setup a context with a timeout.
@@ -930,7 +943,11 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		return nil, err
 	}
 
-	blockCtx, txCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx, ethdb.GetHasTEVM(tx))
+	contractHasTEVM := func(contractHash common.Hash) (bool, error) { return false, nil }
+	if api.TevmEnabled {
+		contractHasTEVM = ethdb.GetHasTEVM(tx)
+	}
+	blockCtx, txCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx, contractHasTEVM, api._blockReader)
 	blockCtx.GasLimit = math.MaxUint64
 	blockCtx.MaxGasLimit = true
 
@@ -955,7 +972,7 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		sdMap := make(map[common.Address]*StateDiffAccount)
 		traceResult.StateDiff = sdMap
 		sd := &StateDiff{sdMap: sdMap}
-		if err = ibs.FinalizeTx(evm.ChainRules, sd); err != nil {
+		if err = ibs.FinalizeTx(evm.ChainRules(), sd); err != nil {
 			return nil, err
 		}
 		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
@@ -1024,11 +1041,17 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, pa
 		var num = rpc.LatestBlockNumber
 		parentNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-	blockNumber, hash, err := rpchelper.GetBlockNumber(*parentNrOrHash, dbtx, api.filters)
+	blockNumber, hash, _, err := rpchelper.GetBlockNumber(*parentNrOrHash, dbtx, api.filters)
 	if err != nil {
 		return nil, err
 	}
-	parentHeader := rawdb.ReadHeader(dbtx, hash, blockNumber)
+
+	// TODO: can read here only parent header
+	parentBlock, err := api.blockWithSenders(dbtx, hash, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	parentHeader := parentBlock.Header()
 	if parentHeader == nil {
 		return nil, fmt.Errorf("parent header %d(%x) not found", blockNumber, hash)
 	}
@@ -1060,26 +1083,31 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
 		var num = rpc.LatestBlockNumber
 		parentNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-	blockNumber, hash, err := rpchelper.GetBlockNumber(*parentNrOrHash, dbtx, api.filters)
+	blockNumber, hash, latest, err := rpchelper.GetBlockNumber(*parentNrOrHash, dbtx, api.filters)
 	if err != nil {
 		return nil, err
 	}
 	var stateReader state.StateReader
-	if num, ok := parentNrOrHash.Number(); ok && num == rpc.LatestBlockNumber {
+	if latest {
 		cacheView, err := api.stateCache.View(ctx, dbtx)
 		if err != nil {
 			return nil, err
 		}
-		stateReader = state.NewCachedReader2(cacheView, dbtx)
+		stateReader = state.NewCachedReader2(cacheView, dbtx) // this cache stays between RPC calls
 	} else {
-		stateReader = state.NewPlainState(dbtx, blockNumber)
+		stateReader = state.NewPlainState(dbtx, blockNumber+1)
 	}
-	stateCache := shards.NewStateCache(32, 0 /* no limit */)
+	stateCache := shards.NewStateCache(32, 0 /* no limit */) // this cache living only during current RPC call, but required to store state writes
 	cachedReader := state.NewCachedReader(stateReader, stateCache)
 	noop := state.NewNoopWriter()
 	cachedWriter := state.NewCachedWriter(noop, stateCache)
 
-	parentHeader := rawdb.ReadHeader(dbtx, hash, blockNumber)
+	// TODO: can read here only parent header
+	parentBlock, err := api.blockWithSenders(dbtx, hash, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	parentHeader := parentBlock.Header()
 	if parentHeader == nil {
 		return nil, fmt.Errorf("parent header %d(%x) not found", blockNumber, hash)
 	}
@@ -1103,6 +1131,12 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
 		header = parentHeader
 		useParent = true
 	}
+
+	contractHasTEVM := func(contractHash common.Hash) (bool, error) { return false, nil }
+	if api.TevmEnabled {
+		contractHasTEVM = ethdb.GetHasTEVM(dbtx)
+	}
+
 	for txIndex, msg := range msgs {
 		if err := libcommon.Stopped(ctx.Done()); err != nil {
 			return nil, err
@@ -1139,7 +1173,7 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
 		}
 
 		// Get a new instance of the EVM.
-		blockCtx, txCtx := transactions.GetEvmContext(msg, header, parentNrOrHash.RequireCanonical, dbtx, ethdb.GetHasTEVM(dbtx))
+		blockCtx, txCtx := transactions.GetEvmContext(msg, header, parentNrOrHash.RequireCanonical, dbtx, contractHasTEVM, api._blockReader)
 		if useParent {
 			blockCtx.GasLimit = math.MaxUint64
 			blockCtx.MaxGasLimit = true
@@ -1172,18 +1206,18 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
 			sdMap := make(map[common.Address]*StateDiffAccount)
 			traceResult.StateDiff = sdMap
 			sd := &StateDiff{sdMap: sdMap}
-			if err = ibs.FinalizeTx(evm.ChainRules, sd); err != nil {
+			if err = ibs.FinalizeTx(evm.ChainRules(), sd); err != nil {
 				return nil, err
 			}
 			sd.CompareStates(initialIbs, ibs)
-			if err = ibs.CommitBlock(evm.ChainRules, cachedWriter); err != nil {
+			if err = ibs.CommitBlock(evm.ChainRules(), cachedWriter); err != nil {
 				return nil, err
 			}
 		} else {
-			if err = ibs.FinalizeTx(evm.ChainRules, noop); err != nil {
+			if err = ibs.FinalizeTx(evm.ChainRules(), noop); err != nil {
 				return nil, err
 			}
-			if err = ibs.CommitBlock(evm.ChainRules, cachedWriter); err != nil {
+			if err = ibs.CommitBlock(evm.ChainRules(), cachedWriter); err != nil {
 				return nil, err
 			}
 		}

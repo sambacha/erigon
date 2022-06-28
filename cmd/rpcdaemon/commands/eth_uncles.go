@@ -9,6 +9,7 @@ import (
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/log/v3"
 )
 
@@ -20,7 +21,7 @@ func (api *APIImpl) GetUncleByBlockNumberAndIndex(ctx context.Context, number rp
 	}
 	defer tx.Rollback()
 
-	blockNum, err := getBlockNumber(number, tx)
+	blockNum, hash, _, err := rpchelper.GetBlockNumber(rpc.BlockNumberOrHashWithNumber(number), tx, api.filters)
 	if err != nil {
 		return nil, err
 	}
@@ -31,7 +32,6 @@ func (api *APIImpl) GetUncleByBlockNumberAndIndex(ctx context.Context, number rp
 	if block == nil {
 		return nil, nil // not error, see https://github.com/ledgerwatch/erigon/issues/1645
 	}
-	hash := block.Hash()
 	additionalFields := make(map[string]interface{})
 	td, err := rawdb.ReadTd(tx, block.Hash(), blockNum)
 	if err != nil {
@@ -41,7 +41,7 @@ func (api *APIImpl) GetUncleByBlockNumberAndIndex(ctx context.Context, number rp
 
 	uncles := block.Uncles()
 	if index >= hexutil.Uint(len(uncles)) {
-		log.Debug("Requested uncle not found", "number", block.Number(), "hash", hash, "index", index)
+		log.Trace("Requested uncle not found", "number", block.Number(), "hash", hash, "index", index)
 		return nil, nil
 	}
 	uncle := types.NewBlockWithHeader(uncles[index])
@@ -73,7 +73,7 @@ func (api *APIImpl) GetUncleByBlockHashAndIndex(ctx context.Context, hash common
 
 	uncles := block.Uncles()
 	if index >= hexutil.Uint(len(uncles)) {
-		log.Debug("Requested uncle not found", "number", block.Number(), "hash", hash, "index", index)
+		log.Trace("Requested uncle not found", "number", block.Number(), "hash", hash, "index", index)
 		return nil, nil
 	}
 	uncle := types.NewBlockWithHeader(uncles[index])
@@ -91,7 +91,7 @@ func (api *APIImpl) GetUncleCountByBlockNumber(ctx context.Context, number rpc.B
 	}
 	defer tx.Rollback()
 
-	blockNum, err := getBlockNumber(number, tx)
+	blockNum, _, _, err := rpchelper.GetBlockNumber(rpc.BlockNumberOrHashWithNumber(number), tx, api.filters)
 	if err != nil {
 		return &n, err
 	}
@@ -116,9 +116,14 @@ func (api *APIImpl) GetUncleCountByBlockHash(ctx context.Context, hash common.Ha
 	}
 	defer tx.Rollback()
 
-	block, err := rawdb.ReadBlockByHash(tx, hash)
+	number := rawdb.ReadHeaderNumber(tx, hash)
+	if number == nil {
+		return nil, nil // not error, see https://github.com/ledgerwatch/erigon/issues/1645
+	}
+
+	block, err := api.blockWithSenders(tx, hash, *number)
 	if err != nil {
-		return &n, err
+		return nil, err
 	}
 	if block == nil {
 		return nil, nil // not error, see https://github.com/ledgerwatch/erigon/issues/1645

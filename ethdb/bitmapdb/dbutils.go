@@ -8,8 +8,8 @@ import (
 	"github.com/RoaringBitmap/roaring"
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/c2h5oh/datasize"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/math"
 	"github.com/ledgerwatch/erigon/ethdb"
 )
@@ -113,7 +113,7 @@ func TruncateRange(db kv.RwTx, bucket string, key []byte, to uint32) error {
 		if _, err := chunk.WriteTo(buf); err != nil {
 			return err
 		}
-		return db.Put(bucket, chunkKey, common.CopyBytes(buf.Bytes()))
+		return db.Put(bucket, chunkKey, libcommon.Copy(buf.Bytes()))
 	})
 }
 
@@ -267,7 +267,7 @@ func TruncateRange64(db kv.RwTx, bucket string, key []byte, to uint64) error {
 		if _, err := chunk.WriteTo(buf); err != nil {
 			return err
 		}
-		return db.Put(bucket, chunkKey, common.CopyBytes(buf.Bytes()))
+		return db.Put(bucket, chunkKey, libcommon.Copy(buf.Bytes()))
 	})
 }
 
@@ -311,9 +311,16 @@ func Get64(db kv.Tx, bucket string, key []byte, from, to uint64) (*roaring64.Bit
 
 // SeekInBitmap - returns value in bitmap which is >= n
 func SeekInBitmap64(m *roaring64.Bitmap, n uint64) (found uint64, ok bool) {
-	m.RemoveRange(0, n)
 	if m.IsEmpty() {
 		return 0, false
 	}
-	return m.Minimum(), true
+	if n == 0 {
+		return m.Minimum(), true
+	}
+	searchRank := m.Rank(n - 1)
+	if searchRank >= m.GetCardinality() {
+		return 0, false
+	}
+	found, _ = m.Select(searchRank)
+	return found, true
 }

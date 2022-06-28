@@ -18,7 +18,6 @@ import (
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/vm"
-	"github.com/ledgerwatch/erigon/core/vm/stack"
 	"github.com/ledgerwatch/erigon/eth/tracers"
 	"github.com/ledgerwatch/erigon/params"
 )
@@ -31,10 +30,10 @@ type BlockGetter interface {
 	GetBlock(hash common.Hash, number uint64) *types.Block
 }
 
-// computeTxEnv returns the execution environment of a certain transaction.
+// ComputeTxEnv returns the execution environment of a certain transaction.
 func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConfig, getHeader func(hash common.Hash, number uint64) *types.Header, contractHasTEVM func(common.Hash) (bool, error), engine consensus.Engine, dbtx kv.Tx, blockHash common.Hash, txIndex uint64) (core.Message, vm.BlockContext, vm.TxContext, *state.IntraBlockState, *state.PlainState, error) {
 	// Create the parent state database
-	reader := state.NewPlainState(dbtx, block.NumberU64()-1)
+	reader := state.NewPlainState(dbtx, block.NumberU64())
 	statedb := state.New(reader)
 
 	if txIndex == 0 && len(block.Transactions()) == 0 {
@@ -45,6 +44,7 @@ func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConf
 
 	BlockContext := core.NewEVMBlockContext(block.Header(), getHeader, engine, nil, contractHasTEVM)
 	vmenv := vm.NewEVM(BlockContext, vm.TxContext{}, statedb, cfg, vm.Config{})
+	rules := vmenv.ChainRules()
 	for idx, tx := range block.Transactions() {
 		select {
 		default:
@@ -54,7 +54,7 @@ func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConf
 		statedb.Prepare(tx.Hash(), blockHash, idx)
 
 		// Assemble the transaction call message and return if the requested offset
-		msg, _ := tx.AsMessage(*signer, block.Header().BaseFee)
+		msg, _ := tx.AsMessage(*signer, block.BaseFee(), rules)
 		TxContext := core.NewEVMTxContext(msg)
 		if idx == int(txIndex) {
 			return msg, BlockContext, TxContext, statedb, reader, nil
@@ -62,11 +62,16 @@ func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConf
 		vmenv.Reset(TxContext, statedb)
 		// Not yet the searched for transaction, execute on top of the current state
 		if _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(tx.GetGas()), true /* refunds */, false /* gasBailout */); err != nil {
-			return nil, vm.BlockContext{}, vm.TxContext{}, nil, nil, fmt.Errorf("transaction %x failed: %v", tx.Hash(), err)
+			return nil, vm.BlockContext{}, vm.TxContext{}, nil, nil, fmt.Errorf("transaction %x failed: %w", tx.Hash(), err)
 		}
 		// Ensure any modifications are committed to the state
-		// Only delete empty objects if EIP158/161 (a.k.a Spurious Dragon) is in effect
-		_ = statedb.FinalizeTx(vmenv.ChainRules, state.NewNoopWriter())
+		// Only delete empty objects if EIP161 (part of Spurious Dragon) is in effect
+		_ = statedb.FinalizeTx(rules, reader)
+
+		if idx+1 == len(block.Transactions()) {
+			// Return the state from evaluating all txs in the block, note no msg or TxContext in this case
+			return nil, BlockContext, vm.TxContext{}, statedb, reader, nil
+		}
 	}
 	return nil, vm.BlockContext{}, vm.TxContext{}, nil, nil, fmt.Errorf("transaction index %d out of range for block %x", txIndex, blockHash)
 }
@@ -100,8 +105,10 @@ func TraceTx(
 				return err
 			}
 		}
-		// Constuct the JavaScript tracer to execute with
-		if tracer, err = tracers.New(*config.Tracer, txCtx); err != nil {
+		// Construct the JavaScript tracer to execute with
+		if tracer, err = tracers.New(*config.Tracer, &tracers.Context{
+			TxHash: txCtx.TxHash,
+		}); err != nil {
 			stream.WriteNil()
 			return err
 		}
@@ -124,7 +131,6 @@ func TraceTx(
 	}
 	// Run the transaction with tracing enabled.
 	vmenv := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: true, Tracer: tracer})
-
 	var refunds bool = true
 	if config != nil && config.NoRefunds != nil && *config.NoRefunds {
 		refunds = false
@@ -140,7 +146,7 @@ func TraceTx(
 			stream.WriteArrayEnd()
 			stream.WriteObjectEnd()
 		}
-		return fmt.Errorf("tracing failed: %v", err)
+		return fmt.Errorf("tracing failed: %w", err)
 	}
 	// Depending on the tracer type, format and return the output
 	if streaming {
@@ -204,22 +210,25 @@ func NewJsonStreamLogger(cfg *vm.LogConfig, ctx context.Context, stream *jsonite
 }
 
 // CaptureStart implements the Tracer interface to initialize the tracing operation.
-func (l *JsonStreamLogger) CaptureStart(depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) error {
-	return nil
+func (l *JsonStreamLogger) CaptureStart(env *vm.EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) {
 }
 
 // CaptureState logs a new structured log message and pushes it out to the environment
 //
 // CaptureState also tracks SLOAD/SSTORE ops to track storage change.
-func (l *JsonStreamLogger) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, rData []byte, contract *vm.Contract, depth int, err error) error {
+func (l *JsonStreamLogger) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
+	contract := scope.Contract
+	memory := scope.Memory
+	stack := scope.Stack
+
 	select {
 	case <-l.ctx.Done():
-		return fmt.Errorf("interrupted")
+		return
 	default:
 	}
 	// check if already accumulated the specified number of logs
 	if l.cfg.Limit != 0 && l.cfg.Limit <= len(l.logs) {
-		return vm.ErrTraceLimitReached
+		return
 	}
 	if !l.firstCapture {
 		l.stream.WriteMore()
@@ -239,7 +248,7 @@ func (l *JsonStreamLogger) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, ga
 				address = common.Hash(stack.Data[stack.Len()-1].Bytes32())
 				value   uint256.Int
 			)
-			env.IntraBlockState.GetState(contract.Address(), &address, &value)
+			env.IntraBlockState().GetState(contract.Address(), &address, &value)
 			l.storage[contract.Address()][address] = common.Hash(value.Bytes32())
 			outputStorage = true
 		}
@@ -328,18 +337,16 @@ func (l *JsonStreamLogger) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, ga
 		l.stream.WriteObjectEnd()
 	}
 	l.stream.WriteObjectEnd()
-	return l.stream.Flush()
+	_ = l.stream.Flush()
 }
 
 // CaptureFault implements the Tracer interface to trace an execution fault
 // while running an opcode.
-func (l *JsonStreamLogger) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, contract *vm.Contract, depth int, err error) error {
-	return nil
+func (l *JsonStreamLogger) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
 }
 
 // CaptureEnd is called after the call finishes to finalize the tracing.
-func (l *JsonStreamLogger) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) error {
-	return nil
+func (l *JsonStreamLogger) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) {
 }
 
 func (l *JsonStreamLogger) CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int) {

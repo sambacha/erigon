@@ -58,11 +58,18 @@ So, when we are generating indexes or hashed state, we do a multi-step process.
 
 This optimization sometimes leads to dramatic (orders of magnitude) write speed improvements.
 
-## Stages (for the up to date list see [`stagedsync.go`](/eth/stagedsync/stagedsync.go) and [`stagebuilder.go`](/eth/stagedsync/stagebuilder.go)):
+## What happens after the Merge?
+
+In the Proof-of-Stake world staged sync becomes somewhat more complicated, as the following diagram shows.
+![](/docs/pos_downloader.png)
+
+## Stages (for the up to date list see [`stages.go`](/eth/stagedsync/stages/stages.go) and [`stagebuilder.go`](/eth/stagedsync/stagebuilder.go)):
 
 Each stage consists of 2 functions `ExecFunc` that progesses the stage forward and `UnwindFunc` that unwinds the stage backwards.
 
-Some of the stages can theoretically work offline though it isn't implemented in the current version.
+Most of the stages can work offline though it isn't implemented in the current version.
+
+We can add/remove stages, so exact stage numbers may change - but order and names stay the same. 
 
 ### Stage 1: [Download Headers Stage](/eth/stagedsync/stage_headers.go)
 
@@ -78,23 +85,11 @@ This stage promotes local HEAD pointer.
 
 Creates an index of blockHash -> blockNumber extracted from the headers for faster lookups and making the sync friendlier for HDDs.
 
-### Stage 3: [Create headers snapshot](/eth/stagedsync/stage_headers_snapshot.go)
-
-Not enabled by default.
-
-Enable by --snapshot.layout
-
 ### Stage 4: [Download Block Bodies Stage](/eth/stagedsync/stage_bodies.go)
 
 At that stage, we download bodies for block headers that we already downloaded.
 
 That is the most intensive stage for the network connection, the vast majority of data is downloaded here.
-
-### Stage 5: [Create bodies snapshot](/eth/stagedsync/stage_bodies_snapshot.go)
-
-Not enabled by default.
-
-Enable by --snapshot.layout
 
 ### Stage 6: [Recover Senders Stage](/eth/stagedsync/stage_senders.go)
 
@@ -121,12 +116,6 @@ This stage can spawn unwinds if the block execution fails.
 ### Stage 8: [Transpile marked VM contracts to TEVM](/eth/stagedsync/stage_tevm.go)
 
 [TODO]
-
-### Stage 9: [Create state snapshot](/eth/stagedsync/stage_state_snapshot.go)
-
-Not enabled by default.
-
-Enable by --snapshot.layout
 
 ### Stage 10: [Generate Hashed State Stage](/eth/stagedsync/stage_hashstate.go)
 

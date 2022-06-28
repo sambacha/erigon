@@ -23,24 +23,20 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/c2h5oh/datasize"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/ledgerwatch/erigon/consensus/aura"
-	"github.com/ledgerwatch/erigon/consensus/aura/consensusconfig"
-	"github.com/ledgerwatch/erigon/ethdb/prune"
-
+	txpool2 "github.com/ledgerwatch/erigon-lib/txpool"
+	"github.com/ledgerwatch/erigon/cmd/downloader/downloader/downloadercfg"
 	"github.com/ledgerwatch/erigon/common"
-	"github.com/ledgerwatch/erigon/consensus"
-	"github.com/ledgerwatch/erigon/consensus/clique"
-	"github.com/ledgerwatch/erigon/consensus/db"
 	"github.com/ledgerwatch/erigon/consensus/ethash"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/eth/gasprice"
+	"github.com/ledgerwatch/erigon/ethdb/prune"
+	"github.com/ledgerwatch/erigon/node/nodecfg/datadir"
 	"github.com/ledgerwatch/erigon/params"
-	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
-	"github.com/ledgerwatch/log/v3"
+	"github.com/ledgerwatch/erigon/params/networkname"
 )
 
 // FullNodeGPO contains default gasprice oracle settings for full node.
@@ -66,6 +62,11 @@ var LightClientGPO = gasprice.Config{
 
 // Defaults contains default settings for use on the Ethereum main net.
 var Defaults = Config{
+	Sync: Sync{
+		UseSnapshots:               false,
+		BlockDownloaderWindow:      32768,
+		BodyDownloadTimeoutSeconds: 30,
+	},
 	Ethash: ethash.Config{
 		CachesInMem:      2,
 		CachesLockMmap:   false,
@@ -76,17 +77,21 @@ var Defaults = Config{
 	NetworkID: 1,
 	Prune:     prune.DefaultMode,
 	Miner: params.MiningConfig{
-		GasFloor: 8000000,
-		GasCeil:  8000000,
+		GasLimit: 30_000_000,
 		GasPrice: big.NewInt(params.GWei),
 		Recommit: 3 * time.Second,
 	},
-	TxPool:      core.DefaultTxPoolConfig,
-	RPCGasCap:   50000000,
-	GPO:         FullNodeGPO,
-	RPCTxFeeCap: 1, // 1 ether
+	DeprecatedTxPool: core.DeprecatedDefaultTxPoolConfig,
+	RPCGasCap:        50000000,
+	GPO:              FullNodeGPO,
+	RPCTxFeeCap:      1, // 1 ether
 
-	BodyDownloadTimeoutSeconds: 30,
+	ImportMode: false,
+	Snapshot: Snapshot{
+		Enabled:    false,
+		KeepBlocks: false,
+		Produce:    true,
+	},
 }
 
 func init() {
@@ -113,17 +118,43 @@ func init() {
 	}
 }
 
-//go:generate gencodec -type Config -formats toml -out gen_config.go
+//go:generate gencodec -dir . -type Config -formats toml -out gen_config.go
 
 type Snapshot struct {
-	Enabled bool
-	Mode    snapshotsync.SnapshotMode
-	Dir     string
-	Seeding bool
+	Enabled        bool
+	KeepBlocks     bool // produce new snapshots of blocks but don't remove blocks from DB
+	Produce        bool // produce new snapshots
+	NoDownloader   bool // possible to use snapshots without calling Downloader
+	DownloaderAddr string
+}
+
+func (s Snapshot) String() string {
+	var out []string
+	if s.Enabled {
+		out = append(out, "--snapshots=true")
+	}
+	if s.KeepBlocks {
+		out = append(out, "--"+FlagSnapKeepBlocks+"=true")
+	}
+	if !s.Produce {
+		out = append(out, "--"+FlagSnapStop+"=true")
+	}
+	return strings.Join(out, " ")
+}
+
+var (
+	FlagSnapKeepBlocks = "snap.keepblocks"
+	FlagSnapStop       = "snap.stop"
+)
+
+func NewSnapCfg(enabled, keepBlocks, produce bool) Snapshot {
+	return Snapshot{Enabled: enabled, KeepBlocks: keepBlocks, Produce: produce}
 }
 
 // Config contains configuration options for ETH protocol.
 type Config struct {
+	Sync Sync
+
 	// The genesis block, which is inserted if the database is empty.
 	// If nil, the Ethereum main net block is used.
 	Genesis *core.Genesis `toml:",omitempty"`
@@ -137,13 +168,17 @@ type Config struct {
 
 	P2PEnabled bool
 
-	Prune        prune.Mode
-	BatchSize    datasize.ByteSize // Batch size for execution stage
-	BadBlockHash common.Hash       // hash of the block marked as bad
+	Prune     prune.Mode
+	BatchSize datasize.ByteSize // Batch size for execution stage
 
-	Snapshot Snapshot
+	ImportMode bool
 
-	BlockDownloaderWindow int
+	BadBlockHash common.Hash // hash of the block marked as bad
+
+	Snapshot   Snapshot
+	Downloader *downloadercfg.Cfg
+
+	Dirs datadir.Dirs
 
 	// Address to connect to external snapshot downloader
 	// empty if you want to use internal bittorrent snapshot downloader
@@ -158,11 +193,14 @@ type Config struct {
 	// Ethash options
 	Ethash ethash.Config
 
-	Clique params.SnapshotConfig
+	Clique params.ConsensusSnapshotConfig
 	Aura   params.AuRaConfig
+	Parlia params.ParliaConfig
+	Bor    params.BorConfig
 
 	// Transaction pool options
-	TxPool core.TxPoolConfig
+	DeprecatedTxPool core.TxPoolConfig
+	TxPool           txpool2.Config
 
 	// Gas Price Oracle options
 	GPO gasprice.Config
@@ -174,56 +212,47 @@ type Config struct {
 	// send-transction variants. The unit is ether.
 	RPCTxFeeCap float64 `toml:",omitempty"`
 
-	StateStream                bool
-	BodyDownloadTimeoutSeconds int // TODO change to duration
+	StateStream bool
 
-	// SyncLoopThrottle sets a minimum time between staged loop iterations
-	SyncLoopThrottle time.Duration
+	MemoryOverlay bool
+
+	// Enable WatchTheBurn stage
+	EnabledIssuance bool
+
+	// URL to connect to Heimdall node
+	HeimdallURL string
+
+	// No heimdall service
+	WithoutHeimdall bool
+	// Ethstats service
+	Ethstats string
+
+	// FORK_NEXT_VALUE (see EIP-3675) block override
+	OverrideMergeNetsplitBlock *big.Int `toml:",omitempty"`
+
+	OverrideTerminalTotalDifficulty *big.Int `toml:",omitempty"`
 }
 
-func CreateConsensusEngine(chainConfig *params.ChainConfig, logger log.Logger, config interface{}, notify []string, noverify bool) consensus.Engine {
-	var eng consensus.Engine
+type Sync struct {
+	UseSnapshots bool
+	// LoopThrottle sets a minimum time between staged loop iterations
+	LoopThrottle time.Duration
 
-	switch consensusCfg := config.(type) {
-	case *ethash.Config:
-		switch consensusCfg.PowMode {
-		case ethash.ModeFake:
-			log.Warn("Ethash used in fake mode")
-			eng = ethash.NewFaker()
-		case ethash.ModeTest:
-			log.Warn("Ethash used in test mode")
-			eng = ethash.NewTester(nil, noverify)
-		case ethash.ModeShared:
-			log.Warn("Ethash used in shared mode")
-			eng = ethash.NewShared()
-		default:
-			engine := ethash.New(ethash.Config{
-				CachesInMem:      consensusCfg.CachesInMem,
-				CachesLockMmap:   consensusCfg.CachesLockMmap,
-				DatasetDir:       consensusCfg.DatasetDir,
-				DatasetsInMem:    consensusCfg.DatasetsInMem,
-				DatasetsOnDisk:   consensusCfg.DatasetsOnDisk,
-				DatasetsLockMmap: consensusCfg.DatasetsLockMmap,
-			}, notify, noverify)
-			eng = engine
-		}
-	case *params.SnapshotConfig:
-		if chainConfig.Clique != nil {
-			eng = clique.New(chainConfig, consensusCfg, db.OpenDatabase(consensusCfg.DBPath, logger, consensusCfg.InMemory))
-		}
-	case *params.AuRaConfig:
-		if chainConfig.Aura != nil {
-			var err error
-			eng, err = aura.NewAuRa(chainConfig.Aura, db.OpenDatabase(consensusCfg.DBPath, logger, consensusCfg.InMemory), chainConfig.Aura.Etherbase, consensusconfig.GetConfigByChain(chainConfig.ChainName))
-			if err != nil {
-				panic(err)
-			}
-		}
-	}
+	BlockDownloaderWindow      int
+	BodyDownloadTimeoutSeconds int // TODO: change to duration
+}
 
-	if eng == nil {
-		panic("unknown config" + spew.Sdump(config))
-	}
+// Chains where snapshots are enabled by default
+var ChainsWithSnapshots map[string]struct{} = map[string]struct{}{
+	networkname.MainnetChainName:    {},
+	networkname.BSCChainName:        {},
+	networkname.GoerliChainName:     {},
+	networkname.RopstenChainName:    {},
+	networkname.MumbaiChainName:     {},
+	networkname.BorMainnetChainName: {},
+}
 
-	return eng
+func UseSnapshotsByChainName(chain string) bool {
+	_, ok := ChainsWithSnapshots[chain]
+	return ok
 }
